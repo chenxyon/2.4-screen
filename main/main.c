@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include "w25q128.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -6,7 +7,17 @@
 #include "driver/i2c.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "version.h"
+#include "esp_partition.h"
+#include "esp_ota_ops.h"
+#define VERSION_MAJOR 1
+#define VERSION_MINOR 0
+#define VERSION_PATCH 0
+#include "font_chinese_longyin.h"
+
+#define FIRMWARE_BACKUP_ADDR 0x000000
+#define FIRMWARE_SIZE 0xE0000
+
+
 
 static const char *TAG = "TFT_TEST";
 
@@ -340,6 +351,62 @@ static void lcd_show_string(uint16_t x, uint16_t y, uint8_t size, char *p, uint1
     }
 }
 
+static int lcd_find_chinese_char(uint32_t code)
+{
+    int low = 0, high = LONGYIN_CHAR_COUNT - 1;
+    while (low <= high) {
+        int mid = (low + high) / 2;
+        if (longyin_char_codes[mid] == code) {
+            return mid;
+        } else if (longyin_char_codes[mid] < code) {
+            low = mid + 1;
+        } else {
+            high = mid - 1;
+        }
+    }
+    return -1;
+}
+
+static void lcd_show_chinese_char(uint16_t x, uint16_t y, uint32_t code, uint16_t color)
+{
+    int index = lcd_find_chinese_char(code);
+    if (index < 0) return;
+
+    lcd_set_window(x, y, x + 15, y + 15);
+
+    const uint8_t *pfont = longyin_font_data[index];
+    uint8_t temp = 0, t1 = 0;
+    uint16_t colortemp = 0;
+
+    for (uint8_t t = 0; t < 32; t += 2) {
+        temp = pfont[t] << 8 | pfont[t + 1];
+        for (t1 = 0; t1 < 16; t1++) {
+            if (temp & 0x8000) {
+                colortemp = color;
+            } else {
+                colortemp = BLACK;
+            }
+            lcd_write_data16(colortemp);
+            temp <<= 1;
+        }
+    }
+}
+
+static void lcd_show_chinese_string(uint16_t x, uint16_t y, uint16_t *str, uint16_t color)
+{
+    uint16_t x0 = x;
+    while (*str != 0) {
+        if (x >= LCD_WIDTH - 15) {
+            x = x0;
+            y += 16;
+        }
+        if (y >= LCD_HEIGHT) break;
+        lcd_show_chinese_char(x, y, *str, color);
+        x += 16;
+        str++;
+    }
+}
+
 static void lcd_init(void)
 {
     gpio_config_t gpio_init_struct;
@@ -442,9 +509,14 @@ static void tft_test_task(void *arg)
     lcd_show_string(50, 110, 16, "Version: ", GREEN);
     lcd_show_string(130, 110, 16, "1.0.0", BLACK);
 
-    lcd_show_string(50, 160, 16, "ABCDEFGHIJKLMNOP", BLACK);
-    lcd_show_string(50, 180, 16, "0123456789!@#$%", BLACK);
-    lcd_show_string(50, 200, 16, "ZXCVBNM<>?:", BLACK);
+    uint16_t chinese_text[] = {0x4F60, 0x597D, 0x4E16, 0x754C, 0, 0, 0, 0};
+    lcd_show_chinese_string(50, 160, chinese_text, RED);
+
+    uint16_t chinese_text2[] = {0x4E2D, 0x6587, 0x663E, 0x793A, 0x6D4B, 0x8BD5, 0, 0};
+    lcd_show_chinese_string(50, 180, chinese_text2, BLUE);
+
+    uint16_t chinese_text3[] = {0x5B57, 0x9B42, 0x9F99, 0x9F99, 0x624B, 0x4E66, 0, 0};
+    lcd_show_chinese_string(50, 200, chinese_text3, GREEN);
 
     ESP_LOGI(TAG, "测试完成");
 
@@ -453,12 +525,180 @@ static void tft_test_task(void *arg)
     }
 }
 
+static esp_err_t firmware_backup_to_ext_flash(void) {
+    const esp_partition_t *running_part = esp_ota_get_running_partition();
+    if (!running_part) {
+        ESP_LOGE(TAG, "无法获取当前运行分区");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "当前运行分区: %s (offset: 0x%06X, size: 0x%06X)",
+             running_part->label, running_part->address, running_part->size);
+    ESP_LOGI(TAG, "当前固件版本: v%d.%d.%d", VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH);
+
+    ESP_LOGI(TAG, "正在擦除外部 Flash 备份区域...");
+    for (uint32_t addr = FIRMWARE_BACKUP_ADDR; addr < FIRMWARE_BACKUP_ADDR + FIRMWARE_SIZE; addr += W25Q128_SECTOR_SIZE) {
+        esp_err_t ret = W25Q_EraseSector(addr);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "擦除扇区 0x%06X 失败: %s", addr, esp_err_to_name(ret));
+            return ret;
+        }
+    }
+    ESP_LOGI(TAG, "擦除完成");
+
+    ESP_LOGI(TAG, "正在备份固件到外部 Flash...");
+    uint8_t *buf = malloc(W25Q128_SECTOR_SIZE);
+    if (!buf) {
+        ESP_LOGE(TAG, "内存分配失败");
+        return ESP_FAIL;
+    }
+
+    for (uint32_t offset = 0; offset < running_part->size; offset += W25Q128_SECTOR_SIZE) {
+        uint32_t read_size = (running_part->size - offset) > W25Q128_SECTOR_SIZE ? W25Q128_SECTOR_SIZE : (running_part->size - offset);
+
+        esp_err_t ret = esp_partition_read(running_part, offset, buf, read_size);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "读取内部 Flash 失败: %s", esp_err_to_name(ret));
+            free(buf);
+            return ret;
+        }
+
+        ret = W25Q_Write(FIRMWARE_BACKUP_ADDR + offset, buf, read_size);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "写入外部 Flash 失败: %s", esp_err_to_name(ret));
+            free(buf);
+            return ret;
+        }
+
+        if ((offset / W25Q128_SECTOR_SIZE) % 16 == 0) {
+            ESP_LOGI(TAG, "备份进度: %d/%d sectors", offset / W25Q128_SECTOR_SIZE, running_part->size / W25Q128_SECTOR_SIZE);
+        }
+    }
+    free(buf);
+
+    ESP_LOGI(TAG, "固件备份完成！");
+    return ESP_OK;
+}
+
+static __attribute__((unused)) esp_err_t firmware_restore_from_ext_flash(void) {
+    const esp_partition_t *ota_part = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
+    if (!ota_part) {
+        ESP_LOGE(TAG, "无法找到 OTA 分区");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "目标恢复分区: %s (offset: 0x%06X, size: 0x%06X)",
+             ota_part->label, ota_part->address, ota_part->size);
+    ESP_LOGI(TAG, "待恢复固件版本: v%d.%d.%d", VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH);
+
+    ESP_LOGI(TAG, "正在擦除目标 OTA 分区...");
+    esp_err_t ret = esp_partition_erase_range(ota_part, 0, ota_part->size);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "擦除 OTA 分区失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(TAG, "擦除完成");
+
+    ESP_LOGI(TAG, "正在从外部 Flash 恢复固件...");
+    uint8_t *buf = malloc(W25Q128_SECTOR_SIZE);
+    if (!buf) {
+        ESP_LOGE(TAG, "内存分配失败");
+        return ESP_FAIL;
+    }
+
+    for (uint32_t offset = 0; offset < FIRMWARE_SIZE; offset += W25Q128_SECTOR_SIZE) {
+        uint32_t read_size = (FIRMWARE_SIZE - offset) > W25Q128_SECTOR_SIZE ? W25Q128_SECTOR_SIZE : (FIRMWARE_SIZE - offset);
+
+        esp_err_t ret = W25Q_Read(FIRMWARE_BACKUP_ADDR + offset, buf, read_size);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "读取外部 Flash 失败: %s", esp_err_to_name(ret));
+            free(buf);
+            return ret;
+        }
+
+        ret = esp_partition_write(ota_part, offset, buf, read_size);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "写入 OTA 分区失败: %s", esp_err_to_name(ret));
+            free(buf);
+            return ret;
+        }
+
+        if ((offset / W25Q128_SECTOR_SIZE) % 16 == 0) {
+            ESP_LOGI(TAG, "恢复进度: %d/%d sectors", offset / W25Q128_SECTOR_SIZE, FIRMWARE_SIZE / W25Q128_SECTOR_SIZE);
+        }
+    }
+    free(buf);
+
+    ESP_LOGI(TAG, "固件恢复完成！");
+    ESP_LOGI(TAG, "正在设置 OTA_1 为启动分区...");
+
+    ret = esp_ota_set_boot_partition(ota_part);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "设置启动分区失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "设置成功！即将重启...");
+    esp_restart();
+
+    return ESP_OK;
+}
+
 void app_main(void)
 {
-    ESP_LOGI(TAG, "应用程序启动");
-    ESP_LOGI(TAG, "版本号: %d.%d.%d", VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH);
+  ESP_LOGI(TAG, "应用程序启动");
 
-    xTaskCreate(tft_test_task, "tft_test_task", 8192, NULL, 5, NULL);
+  if (W25Q_Init() != ESP_OK) {
+    ESP_LOGE(TAG, "W25Q128 Flash 初始化失败");
+  } else {
+    ESP_LOGI(TAG, "W25Q128 Flash 初始化成功");
 
-    ESP_LOGI(TAG, "TFT测试任务已创建");
+    uint32_t test_addr = 0x000000;
+    const char *test_data = "Hello W25Q128!";
+    char read_buf[64] = {0};
+
+    ESP_LOGI(TAG, "正在擦除扇区 0x%06X...", test_addr);
+    esp_err_t ret = W25Q_EraseSector(test_addr);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "擦除失败: %s", esp_err_to_name(ret));
+    } else {
+      ESP_LOGI(TAG, "擦除成功");
+
+      ESP_LOGI(TAG, "正在写入数据: %s", test_data);
+      ret = W25Q_Write(test_addr, (const uint8_t *)test_data, strlen(test_data) + 1);
+      if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "写入失败: %s", esp_err_to_name(ret));
+      } else {
+        ESP_LOGI(TAG, "写入成功");
+
+        ESP_LOGI(TAG, "正在读取数据...");
+        ret = W25Q_Read(test_addr, (uint8_t *)read_buf, strlen(test_data) + 1);
+        if (ret != ESP_OK) {
+          ESP_LOGE(TAG, "读取失败: %s", esp_err_to_name(ret));
+        } else {
+          ESP_LOGI(TAG, "读取成功: %s", read_buf);
+          if (strcmp(test_data, read_buf) == 0) {
+            ESP_LOGI(TAG, "数据验证通过！");
+          } else {
+            ESP_LOGE(TAG, "数据验证失败！");
+          }
+        }
+      }
+
+      ESP_LOGI(TAG, "正在备份当前固件到外部 Flash...");
+      esp_err_t backup_ret = firmware_backup_to_ext_flash();
+      if (backup_ret != ESP_OK) {
+        ESP_LOGE(TAG, "固件备份失败");
+      } else {
+        ESP_LOGI(TAG, "固件备份成功！");
+      }
+    }
+  }
+
+  ESP_LOGI(TAG, "版本号: %d.%d.%d", VERSION_MAJOR, VERSION_MINOR,
+           VERSION_PATCH);
+
+  xTaskCreate(tft_test_task, "tft_test_task", 8192, NULL, 5, NULL);
+
+  ESP_LOGI(TAG, "TFT测试任务已创建");
 }
